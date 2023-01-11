@@ -16,6 +16,9 @@ export class Token {
     @ManyToOne_(() => Owner, {nullable: true})
     owner!: Owner | undefined | null
 
+    @Column_("text", {nullable: true})
+    uri!: string | undefined | null
+
     @OneToMany_(() => Transfer, e => e.token)
     transfers!: Transfer[]
 

@@ -1,11 +1,19 @@
 import { Store, TypeormDatabase } from "@subsquid/typeorm-store";
 import {BlockHandlerContext, EvmBatchProcessor, LogHandlerContext} from '@subsquid/evm-processor'
-import { events } from "./abi/ens";
+import { events, Contract as ContractAPI, functions } from "./abi/bayc";
+import { Multicall } from "./abi/multicall";
 import { Contract, Owner, Token, Transfer } from "./model";
 import { In } from "typeorm";
+import { BigNumber } from "ethers";
+import { maxBy } from "lodash";
 
 const contractAddress =
-  "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85".toLowerCase();
+  // "0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85".toLowerCase();
+  // BAYC
+  "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D".toLowerCase();
+
+const multicallAddress = "0x5BA1e12693Dc8F9c48aAD8770482f4739bEeD696".toLowerCase();
+
 const processor = new EvmBatchProcessor()
 .setDataSource({
   chain: process.env.RPC_ENDPOINT,
@@ -59,18 +67,30 @@ processor.run(new TypeormDatabase(), async (ctx) => {
 let contractEntity: Contract | undefined;
 
 export async function getOrCreateContractEntity(
-  store: Store
+  ctx: BlockHandlerContext<Store>
 ): Promise<Contract> {
   if (contractEntity == null) {
-    contractEntity = await store.get(Contract, contractAddress);
+    contractEntity = await ctx.store.get(Contract, contractAddress);
     if (contractEntity == null) {
+      const contractAPI = new ContractAPI(ctx, contractAddress);
+      let name = "", symbol = "", totalSupply = BigNumber.from(0);
+      try {
+        name = await contractAPI.name();
+        symbol = await contractAPI.symbol();
+        totalSupply = await contractAPI.totalSupply();
+      } catch (error) {
+        ctx.log.warn(`[API] Error while fetching Contract metadata for address ${contractAddress}`);
+        if (error instanceof Error) {
+          ctx.log.warn(`${error.message}`);
+        }
+      }
       contractEntity = new Contract({
         id: contractAddress,
-        name: "Ethereum Name Service",
-        symbol: "ENS",
-        totalSupply: 0n,
+        name: name,
+        symbol: symbol,
+        totalSupply: totalSupply.toBigInt(),
       });
-      await store.insert(contractEntity);
+      await ctx.store.insert(contractEntity);
     }
   }
   return contractEntity;
@@ -168,7 +188,7 @@ async function saveENSData(
     if (token == null) {
       token = new Token({
         id: tokenIdString,
-        contract: await getOrCreateContractEntity(ctx.store),
+        contract: await getOrCreateContractEntity(ctx),
       });
       tokens.set(token.id, token);
     }
@@ -188,6 +208,26 @@ async function saveENSData(
       transfers.add(transfer);
     }
   }
+
+  const maxHeight = maxBy(ensDataArr, d => d.block)!.block;
+  const multicallAPI = new Multicall(ctx, {height: maxHeight}, multicallAddress);
+
+  ctx.log.info(`Calling multicall for ${ ensDataArr.length} tokens...`);
+
+  const results = await multicallAPI.tryAggregate(functions.tokenURI, ensDataArr.map(d => [contractAddress, [BigNumber.from(d.tokenId)]] as [string, BigNumber[]]), 100);
+
+  results.forEach((res, i) => {
+    let t = tokens.get(ensDataArr[i].tokenId.toString());
+    if(t) {
+      let uri = '';
+      if (res.success) {
+        uri = <string>res.value;
+      } else if (res.returnData) {
+        uri = <string>functions.tokenURI.tryDecodeResult(res.returnData) || '';
+      }
+    }
+  });
+  ctx.log.info("Done");
 
   await ctx.store.save([...owners.values()]);
   await ctx.store.save([...tokens.values()]);
